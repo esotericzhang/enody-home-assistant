@@ -32,11 +32,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnodyConfigEntry) -> boo
         entry.runtime_data = coordinator
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except (Exception, CancelledError):
+        await coordinator.async_shutdown()
         await client.async_disconnect()
         raise
 
     async def async_stop(_event: Event) -> None:
         """Close the device connection when Home Assistant stops."""
+        await coordinator.async_shutdown()
         await client.async_disconnect()
 
     entry.async_on_unload(
@@ -49,5 +51,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnodyConfigEntry) -> bo
     """Unload an Enody config entry."""
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
+    await entry.runtime_data.async_shutdown()
     await entry.runtime_data.client.async_disconnect()
     return True

@@ -83,6 +83,7 @@ class FakeFixture:
     def __init__(self, identifier: str = "fixture-1") -> None:
         self._identifier = identifier
         self.display_calls: list[tuple[Any, Any]] = []
+        self.display_attempts = 0
         self.display_error: Exception | None = None
         self.transition_calls: list[Any] = []
         self.transition_error: Exception | None = None
@@ -96,6 +97,7 @@ class FakeFixture:
 
     def display(self, configuration: Any, flux: Any) -> None:
         """Record a display command."""
+        self.display_attempts += 1
         if self.display_error is not None:
             raise self.display_error
         self.display_calls.append((configuration, flux))
@@ -133,6 +135,12 @@ class FakeRuntime:
 
     def __init__(self, fixtures: list[FakeFixture]) -> None:
         self._fixtures = fixtures
+        self._runtime_rs = types.SimpleNamespace(host=self.read_live_host)
+        self.health_count = 0
+        self.health_error: Exception | None = None
+        self.health_entered = Event()
+        self.allow_health = Event()
+        self.allow_health.set()
         self._host: FakeHost | None = None
         self.host_fetch_count = 0
         self.connect_count = 0
@@ -172,6 +180,15 @@ class FakeRuntime:
     def is_connected(self) -> bool:
         """Return whether the fake transport is open."""
         return self.active_connections > 0
+
+    def read_live_host(self) -> FakeHost:
+        """Model the uncached native request independently of Python metadata."""
+        self.health_count += 1
+        self.health_entered.set()
+        self.allow_health.wait()
+        if self.health_error is not None:
+            raise self.health_error
+        return FakeHost(self._fixtures)
 
     def host(self) -> FakeHost:
         """Return the host."""
@@ -295,7 +312,9 @@ class EnodyApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result.exception.__cause__, ValueError)
 
-    async def test_get_info_reuses_connection_and_refreshes_metadata(self) -> None:
+    async def test_get_info_checks_live_connection_but_reuses_cached_metadata(
+        self,
+    ) -> None:
         """Polling performs fresh reads without replacing the connection."""
         client = self.client()
         info = await client.async_get_info()
@@ -307,7 +326,8 @@ class EnodyApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info.name, "Enody EP01 98A316B1")
         self.assertEqual(self.runtime.connect_count, 1)
         self.assertEqual(self.runtime.disconnect_count, 0)
-        self.assertEqual(self.runtime.host_fetch_count, 2)
+        self.assertEqual(self.runtime.host_fetch_count, 1)
+        self.assertEqual(self.runtime.health_count, 2)
 
     async def test_on_off_on_and_poll_share_one_connection(self) -> None:
         """Rapid toggles never open another EP01 connection."""
@@ -510,7 +530,8 @@ class EnodyApiTest(unittest.IsolatedAsyncioTestCase):
             await self.client().async_get_info()
 
         self.assertIsInstance(result.exception.__cause__, ConnectionRefusedError)
-        self.assertEqual(self.runtime.disconnect_count, 1)
+        self.assertEqual(self.runtime.disconnect_count, 2)
+        self.assertEqual(self.runtime.connect_count, 2)
 
     async def test_disconnect_error_does_not_mask_success(self) -> None:
         """Best-effort cleanup cannot turn a successful command into failure."""
@@ -570,3 +591,128 @@ class EnodyApiTest(unittest.IsolatedAsyncioTestCase):
             if disconnect is not None:
                 await asyncio.wait_for(disconnect, 1)
         self.assertEqual(self.runtime.disconnect_count, 1)
+
+    async def test_dead_transport_with_cached_metadata_reconnects_in_poll(self) -> None:
+        """A cached host and true is_connected do not prove transport health."""
+        client = self.client()
+        await client.async_get_info()
+        cached_host = self.runtime.host()
+        self.runtime.health_error = BrokenPipeError("idle reset")
+        self.assertTrue(self.runtime.is_connected())
+        self.assertIs(self.runtime.host(), cached_host)
+        replacement = FakeRuntime([FakeFixture()])
+        FakeWifiConnection.runtime = replacement
+
+        info = await client.async_get_info()
+
+        self.assertEqual(info.fixture_ids, ("fixture-1",))
+        self.assertEqual(self.runtime.health_count, 2)
+        self.assertEqual(self.runtime.host_fetch_count, 1)
+        self.assertEqual(self.runtime.disconnect_count, 1)
+        self.assertEqual(replacement.connect_count, 1)
+        self.assertEqual(replacement.health_count, 1)
+        self.assertIs(client._runtime, replacement)
+
+    async def test_health_retry_is_bounded_and_never_dispatches_control(self) -> None:
+        """Two failed health reads terminate without a command or retry storm."""
+        client = self.client()
+        self.runtime.health_error = TimeoutError("offline")
+        with self.assertRaises(api.EnodyCannotConnect):
+            await client.async_display_fixture("fixture-1", 0.5, transition=5)
+        self.assertEqual(self.runtime.health_count, 2)
+        self.assertEqual(self.runtime.connect_count, 2)
+        self.assertEqual(self.runtime.disconnect_count, 2)
+        self.assertEqual(self.fixture.transition_calls, [])
+        self.assertEqual(self.fixture.display_calls, [])
+        self.assertIsNone(client._runtime)
+
+    async def test_stale_connection_replaced_before_command(self) -> None:
+        """Only the recovered runtime receives the user's single fade."""
+        client = self.client()
+        await client.async_get_info()
+        self.runtime.health_error = RuntimeError('Debug("Broken pipe (os error 32)")')
+        replacement_fixture = FakeFixture()
+        replacement = FakeRuntime([replacement_fixture])
+        FakeWifiConnection.runtime = replacement
+        await client.async_display_fixture("fixture-1", 0.5, transition=5)
+        self.assertEqual(self.fixture.transition_calls, [])
+        self.assertEqual(len(replacement_fixture.transition_calls), 1)
+        self.assertEqual(replacement.health_count, 1)
+        self.assertEqual(self.runtime.disconnect_count, 1)
+
+    async def test_cancelled_health_keeps_recovery_and_unload_serialized(self) -> None:
+        """Cancellation cannot release the SDK lock or reopen after unload."""
+        client = api.EnodyClient(ThreadedFakeHass(), TOKEN_DATA, "192.0.2.10:8788")
+        self.runtime.allow_health.clear()
+        self.runtime.health_error = TimeoutError("stale")
+        poll = asyncio.create_task(client.async_get_info())
+        cleanup = None
+        command = None
+        try:
+            self.assertTrue(
+                await asyncio.to_thread(self.runtime.health_entered.wait, 1)
+            )
+            poll.cancel()
+            with suppress(asyncio.CancelledError):
+                await poll
+            command = asyncio.create_task(client.async_display_fixture("fixture-1", 1))
+            cleanup = asyncio.create_task(client.async_disconnect())
+            await asyncio.sleep(0)
+            self.assertFalse(cleanup.done())
+            self.assertEqual(self.runtime.disconnect_count, 0)
+            self.assertEqual(self.runtime.connect_count, 1)
+        finally:
+            self.runtime.allow_health.set()
+            if cleanup is not None:
+                await asyncio.wait_for(cleanup, 1)
+            if command is not None:
+                with self.assertRaises(api.EnodyCannotConnect):
+                    await asyncio.wait_for(command, 1)
+        self.assertEqual(self.runtime.disconnect_count, 1)
+        self.assertEqual(self.runtime.connect_count, 1)
+        self.assertEqual(self.fixture.display_calls, [])
+        with self.assertRaises(api.EnodyCannotConnect):
+            await client.async_get_info()
+
+    async def test_poll_and_next_command_wait_for_transition(self) -> None:
+        """Health traffic cannot overlap a fade or reorder its next command."""
+        client = api.EnodyClient(ThreadedFakeHass(), TOKEN_DATA, "192.0.2.10:8788")
+        self.fixture.allow_transition.clear()
+        fade = asyncio.create_task(
+            client.async_display_fixture("fixture-1", 0.5, transition=5)
+        )
+        pending = []
+        try:
+            self.assertTrue(
+                await asyncio.to_thread(self.fixture.transition_entered.wait, 1)
+            )
+            pending = [
+                asyncio.create_task(client.async_get_info()),
+                asyncio.create_task(client.async_display_fixture("fixture-1", 0)),
+            ]
+            await asyncio.sleep(0)
+            self.assertEqual(self.runtime.health_count, 1)
+            self.assertEqual(self.fixture.display_calls, [])
+        finally:
+            self.fixture.allow_transition.set()
+            await asyncio.wait_for(asyncio.gather(fade, *pending), 1)
+        self.assertEqual(self.runtime.health_count, 3)
+        self.assertEqual(len(self.fixture.transition_calls), 1)
+        self.assertEqual(self.fixture.display_calls, [(("flux",), ("relative", 0.0))])
+        self.assertEqual(self.runtime.connect_count, 1)
+        await client.async_disconnect()
+
+    async def test_failed_cleanup_prevents_an_overlapping_replacement(self) -> None:
+        """If disconnect cannot finish cleanly, fail closed rather than overlap."""
+        client = self.client()
+        await client.async_get_info()
+        self.runtime.health_error = BrokenPipeError("reset")
+        self.runtime.disconnect_error = RuntimeError("cleanup failed")
+        replacement = FakeRuntime([FakeFixture()])
+        FakeWifiConnection.runtime = replacement
+        for _ in range(2):
+            with self.assertRaises(api.EnodyCannotConnect):
+                await client.async_get_info()
+        self.assertEqual(replacement.connect_count, 0)
+        self.assertEqual(self.runtime.disconnect_count, 1)
+        await client.async_disconnect()

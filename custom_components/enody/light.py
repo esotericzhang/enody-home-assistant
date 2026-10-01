@@ -120,7 +120,7 @@ class EnodyFixtureLight(CoordinatorEntity[EnodyCoordinator], LightEntity):
                 transition=kwargs.get(ATTR_TRANSITION, 0),
             )
         except EnodyError as err:
-            self.coordinator.async_set_update_error(err)
+            self.coordinator.async_command_failed(err)
             LOGGER.debug(
                 "Failed to turn on fixture %s",
                 self._fixture_id,
@@ -136,6 +136,8 @@ class EnodyFixtureLight(CoordinatorEntity[EnodyCoordinator], LightEntity):
         self._attr_color_mode = color_mode
         self._attr_color_temp_kelvin = color_temp_kelvin
         self._attr_xy_color = xy_color
+        if not self.coordinator.last_update_success:
+            self.coordinator.async_set_updated_data(self.coordinator.data)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -147,7 +149,7 @@ class EnodyFixtureLight(CoordinatorEntity[EnodyCoordinator], LightEntity):
                 transition=kwargs.get(ATTR_TRANSITION, 0),
             )
         except EnodyError as err:
-            self.coordinator.async_set_update_error(err)
+            self.coordinator.async_command_failed(err)
             LOGGER.debug(
                 "Failed to turn off fixture %s",
                 self._fixture_id,
@@ -159,4 +161,6 @@ class EnodyFixtureLight(CoordinatorEntity[EnodyCoordinator], LightEntity):
             ) from err
 
         self._attr_is_on = False
+        if not self.coordinator.last_update_success:
+            self.coordinator.async_set_updated_data(self.coordinator.data)
         self.async_write_ha_state()

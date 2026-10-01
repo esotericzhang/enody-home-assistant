@@ -5,7 +5,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from logging import getLogger
-from threading import Lock
+from threading import Event, Lock
+from time import monotonic
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -59,6 +60,18 @@ def _load_enody() -> Any:
         raise EnodyDependencyError("Unable to import enody-py") from err
 
 
+def _read_live_host(runtime: Any) -> Any:
+    """Send HostCommand::Info on the command connection (enody==0.2.3).
+
+    Runtime.host(), Host.version() and Host.fixtures() cache their results in
+    the Python wrapper. There is no public lightweight health request there.
+    The native Runtime.host() fetches ONLY host info, without the fixture/source
+    hierarchy. Keep this private bridge isolated and covered by test_sdk.py;
+    recheck it when changing the SDK pin. Native Host.version() alone is cached.
+    """
+    return runtime._runtime_rs.host()
+
+
 def pair_device_sync(
     endpoint: str,
     on_approval: ApprovalCallback | None = None,
@@ -94,22 +107,22 @@ class EnodyClient:
         self._token_data = token_data
         self._endpoint = endpoint
         self._lock = Lock()
+        self._closed = Event()
         self._runtime: Any | None = None
 
     async def async_get_info(self) -> EnodyDeviceInfo:
-        """Return current device metadata."""
+        """Check the live connection and return device metadata."""
         return await self._hass.async_add_executor_job(self._get_info_sync)
 
     def _get_info_sync(self) -> EnodyDeviceInfo:
         """Read host and fixture metadata."""
-        with self._lock, self._connected_runtime() as (_enody, runtime):
-            host = runtime.host()
-            version = host.version()
+        with self._lock, self._connected_runtime() as (_enody, runtime, live_host):
+            version = live_host.version()
             return EnodyDeviceInfo(
-                host_id=str(host.identifier()).strip().lower(),
+                host_id=str(live_host.identifier()).strip().lower(),
                 firmware_version=str(version) if version is not None else None,
                 fixture_ids=tuple(
-                    str(fixture.identifier()) for fixture in host.fixtures()
+                    str(fixture.identifier()) for fixture in runtime.host().fixtures()
                 ),
             )
 
@@ -141,7 +154,7 @@ class EnodyClient:
         transition: float,
     ) -> None:
         """Send one command and wait for the device to finish."""
-        with self._lock, self._connected_runtime() as (enody, runtime):
+        with self._lock, self._connected_runtime() as (enody, runtime, _live_host):
             fixtures = {
                 str(fixture.identifier()): fixture
                 for fixture in runtime.host().fixtures()
@@ -160,20 +173,17 @@ class EnodyClient:
                 )
 
     @contextmanager
-    def _connected_runtime(self) -> Iterator[tuple[Any, Any]]:
-        """Reuse the device connection and discard it only on failure."""
+    def _connected_runtime(self) -> Iterator[tuple[Any, Any, Any]]:
+        """Check/recover the connection before yielding; never replay controls.
+
+        The thread lock covers health, reconnect, commands and disconnect, even
+        if the awaiting asyncio task is cancelled. An asyncio timeout cannot
+        stop SDK work and must never be used to release this serialization.
+        """
         try:
             enody = _load_enody()
-            if self._runtime is not None and not self._runtime.is_connected():
-                self._disconnect_locked()
-            if self._runtime is None:
-                token = enody.Token.from_dict(self._token_data)
-                self._runtime = enody.WifiConnection.runtime_from_endpoint(
-                    token,
-                    self._endpoint,
-                )
-                self._runtime.connect()
-            yield enody, self._runtime
+            live_host = self._healthy_host_locked(enody)
+            yield enody, self._runtime, live_host
         except EnodyError:
             self._disconnect_locked()
             raise
@@ -183,8 +193,45 @@ class EnodyClient:
                 "Unable to communicate with the Enody device"
             ) from err
 
+    def _healthy_host_locked(self, enody: Any) -> Any:
+        """Try a live read, then at most one reconnect and read-only retry."""
+        for attempt in range(2):
+            if self._closed.is_set():
+                raise EnodyCannotConnect("Enody client is closed")
+            try:
+                if self._runtime is not None and not self._runtime.is_connected():
+                    self._disconnect_locked()
+                if self._closed.is_set():
+                    raise EnodyCannotConnect("Enody client is closed")
+                if self._runtime is None:
+                    token = enody.Token.from_dict(self._token_data)
+                    self._runtime = enody.WifiConnection.runtime_from_endpoint(
+                        token, self._endpoint
+                    )
+                    LOGGER.debug("Opening Enody command connection")
+                    self._runtime.connect()
+                started = monotonic()
+                host = _read_live_host(self._runtime)
+                LOGGER.debug(
+                    "Enody live health request succeeded in %.3f s (attempt %s)",
+                    monotonic() - started,
+                    attempt + 1,
+                )
+                return host
+            except Exception:
+                self._disconnect_locked()
+                if attempt == 1 or self._closed.is_set():
+                    raise
+                LOGGER.debug(
+                    "Enody live health request failed; reconnecting once",
+                    exc_info=True,
+                )
+        raise AssertionError("Health retry loop exhausted")
+
     async def async_disconnect(self) -> None:
         """Close the connection after any pending device work finishes."""
+        # Set before queueing cleanup so queued polls/commands cannot reopen it.
+        self._closed.set()
         await self._hass.async_add_executor_job(self._disconnect_sync)
 
     def _disconnect_sync(self) -> None:
@@ -199,6 +246,8 @@ class EnodyClient:
             try:
                 runtime.disconnect()
             except Exception:
+                # If cleanup fails, we cannot safely create another runtime.
+                self._closed.set()
                 LOGGER.debug("Failed to disconnect Enody runtime", exc_info=True)
 
 

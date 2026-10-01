@@ -42,6 +42,10 @@ choose **Reconfigure** to pair it again.
 
 - Each Home Assistant action waits for one device command to finish.
 - Device failures are returned to the caller instead of being hidden.
+- The persistent connection is checked every 30 seconds and before controls.
+  Failed health checks reconnect and retry once.
+- Failed controls trigger an immediate health refresh to restore availability.
+  Controls are never replayed because the lamp may already have applied them.
 - Home Assistant marks the entity as assumed state and tracks the last
   successful target while the integration is running.
 - The `transition` parameter on `light.turn_on` and `light.turn_off` specifies a
@@ -99,6 +103,20 @@ require HA 2026 or override HA's `aiohttp` version.
 The runtime dependency is pinned to `enody==0.2.3` in both `pyproject.toml` and
 the Home Assistant manifest. This release exposes the device-side Transition API
 and releases the Python GIL during blocking device operations.
+
+### Connection health
+
+The SDK's Python wrapper caches host and fixture metadata. The isolated
+`api._read_live_host()` bridge calls `runtime._runtime_rs.host()` to send one
+uncached `HostCommand::Info` request over the command connection, without
+reloading the fixture hierarchy. Recheck this private API and its contract tests
+in `tests/test_sdk.py` when updating the SDK pin.
+
+All SDK work shares an executor lock, including reconnect and disconnect.
+Cancellation must not release serialization while an SDK thread is still
+running. The SDK limits host-response waiting to 500 ms but has no overall
+connection deadline, so stalled SDK calls can delay unload. Long transitions
+also delay health polling.
 
 ## Releases
 

@@ -116,6 +116,7 @@ async def test_on_off_on_services_reuse_sdk_connection(hass: HomeAssistant) -> N
     host.fixtures.return_value = [fixture]
     runtime = Mock()
     runtime.host.return_value = host
+    runtime._runtime_rs.host.return_value = host
     runtime.is_connected.return_value = True
     sdk = Mock()
     sdk.WifiConnection.runtime_from_endpoint.return_value = runtime
@@ -145,6 +146,7 @@ async def test_on_off_on_services_reuse_sdk_connection(hass: HomeAssistant) -> N
         runtime.connect.assert_called_once()
         runtime.disconnect.assert_not_called()
         assert fixture.display.call_count == 3
+        assert runtime._runtime_rs.host.call_count == 5
 
         assert await hass.config_entries.async_unload(entry.entry_id)
         await hass.async_block_till_done()
@@ -239,6 +241,7 @@ async def test_light_failure_reaches_the_service_caller(
     client = _client()
     client.async_display_fixture.side_effect = EnodyCannotConnect("offline")
     entity_id = await _setup(hass, entry, client)
+    client.async_get_info.side_effect = EnodyCannotConnect("still offline")
 
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
@@ -254,7 +257,11 @@ async def test_light_failure_reaches_the_service_caller(
 
     assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
 
+    await hass.async_block_till_done()
+    client.async_display_fixture.assert_awaited_once()
+    assert client.async_get_info.await_count == 2
     client.async_display_fixture.side_effect = None
+    client.async_get_info.side_effect = None
     await entry.runtime_data.async_refresh()
     assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
@@ -275,6 +282,7 @@ async def test_turn_off_failure_preserves_the_on_state(
         blocking=True,
     )
     client.async_display_fixture.side_effect = EnodyCannotConnect("offline")
+    client.async_get_info.side_effect = EnodyCannotConnect("still offline")
 
     with pytest.raises(HomeAssistantError):
         await hass.services.async_call(
@@ -286,7 +294,11 @@ async def test_turn_off_failure_preserves_the_on_state(
 
     assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
 
+    await hass.async_block_till_done()
+    assert client.async_display_fixture.await_count == 2
+    assert client.async_get_info.await_count == 2
     client.async_display_fixture.side_effect = None
+    client.async_get_info.side_effect = None
     await entry.runtime_data.async_refresh()
     assert hass.states.get(entity_id).state == "on"
 
@@ -430,3 +442,119 @@ async def test_platform_setup_failure_closes_connection(hass: HomeAssistant) -> 
     ):
         assert not await hass.config_entries.async_setup(entry.entry_id)
     client.async_disconnect.assert_awaited_once()
+
+
+@pytest.mark.parametrize("service", [SERVICE_TURN_ON, SERVICE_TURN_OFF])
+@pytest.mark.parametrize("transition", [0, 5])
+async def test_command_failure_recovers_promptly_without_replay(
+    hass: HomeAssistant, service: str, transition: float
+) -> None:
+    """A failed control reconnects now, while preserving the last target."""
+    from tests.test_api import FakeFixture, FakeRuntime
+
+    fixture = FakeFixture()
+    runtime = FakeRuntime([fixture])
+    replacement_fixture = FakeFixture()
+    replacement = FakeRuntime([replacement_fixture])
+    sdk = Mock()
+    sdk.WifiConnection.runtime_from_endpoint.side_effect = [runtime, replacement]
+    entry = _entry()
+    entry.add_to_hass(hass)
+    with patch("custom_components.enody.api._load_enody", return_value=sdk):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        entity_id = er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )[0].entity_id
+        await hass.services.async_call(
+            LIGHT_DOMAIN, SERVICE_TURN_ON, {ATTR_ENTITY_ID: entity_id}, blocking=True
+        )
+        fixture.display_error = TimeoutError("may already have applied target")
+        fixture.transition_error = TimeoutError("may already have started fade")
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                LIGHT_DOMAIN,
+                service,
+                {ATTR_ENTITY_ID: entity_id, ATTR_TRANSITION: transition},
+                blocking=True,
+            )
+        # No clock advancement and no manual refresh: command-error recovery.
+        await hass.async_block_till_done()
+        assert runtime.disconnect_count == 1
+        assert replacement.connect_count == 1
+        assert replacement.health_count == 1
+        assert replacement_fixture.display_calls == []
+        assert replacement_fixture.transition_calls == []
+        assert len(fixture.transition_calls) == (1 if transition else 0)
+        assert fixture.display_attempts == (1 if transition else 2)
+        assert entry.runtime_data.last_update_success
+        assert hass.states.get(entity_id).state == "on"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert replacement.disconnect_count == 1
+
+
+async def test_command_recovery_is_coalesced_and_stops_on_unload(
+    hass: HomeAssistant,
+) -> None:
+    """Repeated error reports share one refresh; unloading cancels it."""
+    entry = _entry()
+    client = _client()
+    await _setup(hass, entry, client)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_health() -> EnodyDeviceInfo:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return DEVICE_INFO
+
+    client.async_get_info.side_effect = blocked_health
+    coordinator = entry.runtime_data
+    for _ in range(5):
+        coordinator.async_command_failed(EnodyCannotConnect("lost reply"))
+    await asyncio.wait_for(started.wait(), 1)
+    assert client.async_get_info.await_count == 2
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert cancelled.is_set()
+    assert coordinator._recovery_task is None
+    client.async_disconnect.assert_awaited_once()
+    coordinator.async_command_failed(EnodyCannotConnect("late failure"))
+    await hass.async_block_till_done()
+    assert client.async_get_info.await_count == 2
+
+
+async def test_scheduled_poll_makes_live_request_and_recovers(
+    hass: HomeAssistant,
+) -> None:
+    """The existing 30-second timer checks I/O and replaces a stale socket."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from tests.test_api import FakeFixture, FakeRuntime
+
+    runtime = FakeRuntime([FakeFixture()])
+    replacement = FakeRuntime([FakeFixture()])
+    sdk = Mock()
+    sdk.WifiConnection.runtime_from_endpoint.side_effect = [runtime, replacement]
+    entry = _entry()
+    entry.add_to_hass(hass)
+    with patch("custom_components.enody.api._load_enody", return_value=sdk):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        runtime.health_error = BrokenPipeError("idle reset")
+        assert runtime.is_connected()
+        assert runtime.host_fetch_count == 1
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+        await hass.async_block_till_done()
+        assert runtime.health_count == 2
+        assert replacement.health_count == 1
+        assert entry.runtime_data.last_update_success
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
